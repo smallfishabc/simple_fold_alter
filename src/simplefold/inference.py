@@ -82,17 +82,21 @@ def initialize_folding_model(args):
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_path = os.path.join(ckpt_dir, f"{simplefold_model}.ckpt")
 
-    # create folding model
-    ckpt_path = os.path.join(ckpt_dir, f"{simplefold_model}.ckpt")
+    # create folding model - check if checkpoint exists first
     if not os.path.exists(ckpt_path):
+        print(f"Checkpoint not found at {ckpt_path}, downloading...")
         os.makedirs(ckpt_dir, exist_ok=True)
         os.system(f"curl -L {ckpt_url_dict[simplefold_model]} -o {ckpt_path}")
+    else:
+        print(f"Using existing checkpoint at {ckpt_path}")
+    
     cfg_path = get_config_path(f"configs/model/architecture/foldingdit_{simplefold_model[11:]}.yaml")
 
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     # load model checkpoint
     if args.backend == 'torch':
+        # Support both CUDA and ROCm (AMD GPU)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model_config = omegaconf.OmegaConf.load(cfg_path)
         model = hydra.utils.instantiate(model_config)
@@ -120,11 +124,14 @@ def initialize_plddt_module(args, device):
     if not args.plddt:
         return None, None
 
-    # load pLDDT module if specified
+    # load pLDDT module if specified - check if checkpoint exists first
     plddt_ckpt_path = os.path.join(args.ckpt_dir, "plddt.ckpt")
     if not os.path.exists(plddt_ckpt_path):
+        print(f"pLDDT checkpoint not found at {plddt_ckpt_path}, downloading...")
         os.makedirs(args.ckpt_dir, exist_ok=True)
         os.system(f"curl -L {plddt_ckpt_url} -o {plddt_ckpt_path}")
+    else:
+        print(f"Using existing pLDDT checkpoint at {plddt_ckpt_path}")
 
     plddt_module_path = get_config_path("configs/model/architecture/plddt_module.yaml")
     plddt_checkpoint = torch.load(plddt_ckpt_path, map_location="cpu", weights_only=False)
@@ -148,8 +155,11 @@ def initialize_plddt_module(args, device):
 
     plddt_out_module.eval()
     print(f"pLDDT output module loaded with {args.backend} backend.")
-
-    plddt_latent_ckpt_path = os.path.join(args.ckpt_dir, "simplefold_1.6B.ckpt")
+print(f"pLDDT latent checkpoint not found at {plddt_latent_ckpt_path}, downloading...")
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        os.system(f"curl -L {ckpt_url_dict['simplefold_1.6B']} -o {plddt_latent_ckpt_path}")
+    else:
+        print(f"Using existing pLDDT latent checkpoint atold_1.6B.ckpt")
     if not os.path.exists(plddt_latent_ckpt_path):
         os.makedirs(args.ckpt_dir, exist_ok=True)
         os.system(f"curl -L {ckpt_url_dict['simplefold_1.6B']} -o {plddt_latent_ckpt_path}")
@@ -180,8 +190,13 @@ def initialize_plddt_module(args, device):
 
 
 def initialize_esm_model(args, device):
+    # Skip ESM model loading if using pre-computed embeddings
+    if args.use_precomputed_esm:
+        print("Using pre-computed ESM embeddings, skipping ESM model initialization.")
+        return None, None, None
+    
     # load ESM2 model
-    esm_model_name = "esm2_150M"  # Changed from esm2_3B for lower memory usage
+    esm_model_name = "esm2_3B"
     esm_model, esm_dict = esm_registry[esm_model_name]()
     af2_to_esm = _af2_to_esm(esm_dict)
 
@@ -189,8 +204,8 @@ def initialize_esm_model(args, device):
         esm_model = esm_model.to(device)
         af2_to_esm = af2_to_esm.to(device)
     elif args.backend == 'mlx':
-        # ESM2-150M specs: 30 layers, 640 dim, 20 heads
-        esm_model_mlx = ESM2MLX(num_layers=30, embed_dim=640, attention_heads=20)
+        # ESM2-3B specs: 36 layers, 2560 dim, 40 heads
+        esm_model_mlx = ESM2MLX(num_layers=36, embed_dim=2560, attention_heads=40)
         esm_state_dict_torch = esm_model.cpu().state_dict()
 
         esm_state_dict_torch = {k: mx.array(v) for k, v in starmap(map_torch_to_mlx, esm_state_dict_torch.items()) if k is not None}
@@ -314,32 +329,54 @@ def predict_structures_from_fastas(args):
         ccd_path=cache / "ccd.pkl",
     )
 
-    for struct_file in output_dir.glob("structures/*.npz"):
-        record_file = output_dir / "records" / f"{struct_file.stem}.json"
-
-        # prepare the target protein data for inference
-        batch, structure, record = process_one_inference_structure(
-            struct_file, record_file,
-            tokenizer, featurizer, processor,
-            esm_model, esm_dict, af2_to_esm,
-        )
-
-        sampled_coord, pad_mask, plddts = generate_structure(
-            args, batch, sampler, flow, processor,
-            model, plddt_latent_module, plddt_out_module, device
-        )
-
-        for i in range(args.nsample_per_protein):
-            sampled_coord_i = sampled_coord[i]
-            pad_mask_i = pad_mask[i]
-
-            # save the generated structure
-            structure_save = process_structure(
-                deepcopy(structure), sampled_coord_i, pad_mask_i, record, backend=args.backend
+    # Collect all structure files for batch processing
+    struct_files = list(output_dir.glob("structures/*.npz"))
+    record_files = [output_dir / "records" / f"{sf.stem}.json" for sf in struct_files]
+    
+    # Process in batches
+    batch_size = args.batch_size if hasattr(args, 'batch_size') else 1
+    
+    for batch_idx in range(0, len(struct_files), batch_size):
+        batch_struct_files = struct_files[batch_idx:batch_idx + batch_size]
+        batch_record_files = record_files[batch_idx:batch_idx + batch_size]
+        
+        print(f"\nProcessing batch {batch_idx // batch_size + 1}/{(len(struct_files) + batch_size - 1) // batch_size}")
+        print(f"Files in batch: {[sf.stem for sf in batch_struct_files]}")
+        
+        # Process each structure in the batch
+        for struct_file, record_file in zip(batch_struct_files, batch_record_files):
+            # prepare the target protein data for inference
+            batch, structure, record = process_one_inference_structure(
+                struct_file, record_file,
+                tokenizer, featurizer, processor,
+                esm_model, esm_dict, af2_to_esm,
             )
-            outname = f"{record.id}_sampled_{i}"
-            save_structure(
-                structure_save, prediction_dir, outname,
-                output_format=args.output_format,
-                plddts=plddts[i] if plddts is not None else None
+            
+            # Load pre-computed ESM embeddings if available
+            if args.use_precomputed_esm and hasattr(args, 'esm_embed_dir') and args.esm_embed_dir:
+                esm_embed_path = Path(args.esm_embed_dir) / f"{struct_file.stem}_esm.pt"
+                if esm_embed_path.exists():
+                    print(f"Loading pre-computed ESM embeddings from {esm_embed_path}")
+                    batch['esm_s'] = torch.load(esm_embed_path, map_location=device)
+                else:
+                    print(f"Warning: ESM embedding file {esm_embed_path} not found, will compute on-the-fly")
+
+            sampled_coord, pad_mask, plddts = generate_structure(
+                args, batch, sampler, flow, processor,
+                model, plddt_latent_module, plddt_out_module, device
             )
+
+            for i in range(args.nsample_per_protein):
+                sampled_coord_i = sampled_coord[i]
+                pad_mask_i = pad_mask[i]
+
+                # save the generated structure
+                structure_save = process_structure(
+                    deepcopy(structure), sampled_coord_i, pad_mask_i, record, backend=args.backend
+                )
+                outname = f"{record.id}_sampled_{i}"
+                save_structure(
+                    structure_save, prediction_dir, outname,
+                    output_format=args.output_format,
+                    plddts=plddts[i] if plddts is not None else None
+                )

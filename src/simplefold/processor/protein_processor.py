@@ -169,9 +169,12 @@ class ProteinDataProcessor:
 
         batch = self.batch_to_device(batch, multiplicity=self.inference_multiplicity)
 
+        # Only compute ESM features if they're not already in batch and esm_model is provided
         if esm_model is not None and batch.get('esm_s', None) is None:
-            print("Processing ESM features for inference...")
+            print("Computing ESM features for inference...")
             self.process_esm(batch, esm_model, esm_dict, af2_to_esm, inference=True)
+        elif batch.get('esm_s', None) is not None:
+            print("Using pre-computed ESM embeddings from batch")
 
         if self.backend == "mlx":
             batch = self.batch_to_mlx(batch)

@@ -238,7 +238,7 @@ class InferenceWrapper:
 
     def initialize_esm_model(self):
         # load ESM2 model
-        esm_model_name = "esm2_150M"  # Changed from esm2_3B for lower memory usage
+        esm_model_name = "esm2_3B"
         esm_model, esm_dict = esm_registry[esm_model_name]()
         af2_to_esm = _af2_to_esm(esm_dict)
 
@@ -246,8 +246,8 @@ class InferenceWrapper:
             esm_model = esm_model.to(self.device)
             af2_to_esm = af2_to_esm.to(self.device)
         elif self.backend == "mlx":
-            # ESM2-150M specs: 30 layers, 640 dim, 20 heads
-            esm_model_mlx = ESM2MLX(num_layers=30, embed_dim=640, attention_heads=20)
+            # ESM2-3B specs: 36 layers, 2560 dim, 40 heads
+            esm_model_mlx = ESM2MLX(num_layers=36, embed_dim=2560, attention_heads=40)
             esm_state_dict_torch = esm_model.cpu().state_dict()
 
             esm_state_dict_torch = {
